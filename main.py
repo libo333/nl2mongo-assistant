@@ -56,6 +56,19 @@ def serialize(doc):
         elif isinstance(v, datetime):
             doc[k] = v.isoformat()
     return doc
+
+def infer_schema(coll, sample_size: int = 5) -> dict:
+    """采样文档，推断每个字段的类型"""
+    docs = list(coll.find().limit(sample_size))
+    if not docs:
+        return {}
+
+    schema = {}
+    for doc in docs:
+        for key, value in doc.items():
+            if key not in schema and value is not None:
+                schema[key] = type(value).__name__
+    return schema
 # ---------- Prompt ----------
 
 SYSTEM_PROMPT = """你是一个 MongoDB 查询生成器。用户会给你集合的字段结构(schema)和一个自然语言问题。
@@ -116,6 +129,31 @@ def validate_query(q: dict, limit: int) -> dict:
         raise HTTPException(400, "包含 $where，已拦截（存在注入风险）")
     return q
 
+def run_mongo_query(collection: str, mongo_query: dict, limit: int) -> list:
+    """校验并执行查询，返回序列化后的文档列表"""
+    safe = validate_query(mongo_query, limit)
+    coll = db[collection]
+
+    if safe["operation"] == "find":
+        cursor = coll.find(
+            safe.get("filter", {}),
+            safe.get("projection") or None,
+        )
+        if safe.get("sort"):
+            cursor = cursor.sort(list(safe["sort"].items()))
+        return [serialize(d) for d in cursor.limit(safe["limit"])]
+
+    pipeline = list(safe.get("pipeline", []))
+    pipeline.append({"$limit": safe["limit"]})
+    return [serialize(d) for d in coll.aggregate(pipeline)]
+
+
+class RunRequest(BaseModel):
+    question: str = Field(..., description="自然语言问题")
+    collection: str = Field(..., description="集合名")
+    schema: dict = Field(default={}, description="集合字段结构")
+    limit: int = Field(default=20, ge=1, le=100)
+
 # ---------- 路由 ----------
 
 @app.get("/")
@@ -125,6 +163,13 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.get("/schema/{collection}")
+def get_schema(collection: str):
+    schema = infer_schema(db[collection])
+    if not schema:
+        raise HTTPException(404, f"集合 {collection} 不存在或为空")
+    return {"collection": collection, "schema": schema, "sampled": True}
 
 @app.post("/query", response_model=QueryResponse)
 def query(req: QueryRequest):
@@ -165,3 +210,24 @@ def execute_query(req: ExecuteRequest):
         raise HTTPException(500, f"查询执行失败：{e}")
 
     return {"count": len(docs), "data": docs}
+
+@app.post("/query/run")
+def run(req: RunRequest):
+    """一体化：NL → 生成 MongoDB 查询 → 执行 → 返回数据"""
+    try:
+        raw = nl_to_mongo(req.question, req.collection, req.schema)
+        safe = validate_query(raw, req.limit)
+        explanation = safe.pop("explanation", "")
+        docs = run_mongo_query(req.collection, safe, req.limit)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"执行失败：{e}")
+
+    return {
+        "collection": req.collection,
+        "mongo_query": safe,
+        "explanation": explanation,
+        "count": len(docs),
+        "data": docs,
+    }
